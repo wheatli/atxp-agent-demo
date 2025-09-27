@@ -8,6 +8,8 @@ interface Text {
   id: number;
   text: string;
   timestamp: string;
+  imageUrl: string; 
+  fileName: string; 
 }
 
 // Define the Stage interface for progress tracking
@@ -293,9 +295,20 @@ function App(): JSX.Element {
                 <div key={text.id} className="text-item">
                   <p className="text-content">{text.text}</p>
                   {/* TODO: Implement displaying the properties you need for your use case */}
+                  {text.imageUrl && ( 
+                    <figure> 
+                      <img src={text.imageUrl} alt={text.text} className="text-image" />
+                      <figcaption>{text.fileName}</figcaption> 
+                    </figure> 
+                  )} 
                   <small className="text-timestamp">
                     Submitted: {formatDate(text.timestamp)}
                   </small>
+                  {text.fileName && ( 
+                    <small className="text-fileName">
+                        File ID: {text.fileName} 
+                    </small> 
+                  )} 
                 </div>
               ))}
             </div>

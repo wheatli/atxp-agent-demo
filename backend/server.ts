@@ -5,10 +5,6 @@ import path from 'path';
 import dotenv from 'dotenv';
 import { sendSSEUpdate, addSSEClient, removeSSEClient, sendStageUpdate } from './stage';
 
-// Import the ATXP client SDK
-import { atxpClient, ATXPAccount } from '@atxp/client';
-import { ConsoleLogger, LogLevel } from '@atxp/common';
-
 // Load environment variables
 dotenv.config();
 
@@ -22,8 +18,57 @@ if (!ATXP_CONNECTION_STRING) {
   throw new Error('ATXP_CONNECTION_STRING is not set');
 }
 
+// Dynamic imports for ATXP modules
+let atxpClient: any;
+let ATXPAccount: any;
+let ConsoleLogger: any;
+let LogLevel: any;
+
+// Initialize ATXP modules
+async function initATXP() {
+  if (!atxpClient) {
+    try {
+      // Try ES module import
+      const atxpModule = await eval('import("@atxp/client")');
+      atxpClient = atxpModule.atxpClient;
+      ATXPAccount = atxpModule.ATXPAccount;
+    } catch (error) {
+      console.error('Failed to import ATXP client:', error);
+      // Fallback - create mock functions for development
+      atxpClient = async () => ({
+        callTool: async () => ({ content: [{ type: 'text', text: 'Mock response' }] })
+      });
+      ATXPAccount = class {
+        constructor(connectionString: string, options: any) {
+          console.log('Mock ATXPAccount created');
+        }
+      };
+    }
+  }
+  if (!ConsoleLogger) {
+    try {
+      const commonModule = await eval('import("@atxp/common")');
+      ConsoleLogger = commonModule.ConsoleLogger;
+      LogLevel = commonModule.LogLevel;
+    } catch (error) {
+      console.error('Failed to import ATXP common:', error);
+      // Fallback
+      ConsoleLogger = console;
+      LogLevel = { INFO: 'info', ERROR: 'error' };
+    }
+  }
+}
+
 // Create an ATXPAccount object using the ATXP_CONNECTION_STRING
-const account = new ATXPAccount(ATXP_CONNECTION_STRING, {network: 'base'});
+let account: any;
+
+async function getAccount() {
+  if (!account) {
+    await initATXP();
+    account = new ATXPAccount(ATXP_CONNECTION_STRING, {network: 'base'});
+  }
+  return account;
+}
 
 // Set up CORS and body parsing middleware
 app.use(cors({
@@ -41,6 +86,8 @@ interface Text {
   id: number;
   text: string;
   timestamp: string;
+  imageUrl: string; 
+  fileName: string; 
 }
 
 // In-memory storage for texts (in production, use a database)
@@ -50,17 +97,30 @@ let texts: Text[] = [];
 // See "Step 1" at https://docs.atxp.ai/client/guides/tutorial#set-up-the-connections-to-the-mcp-servers for more details.
 // For example, if you want to use the ATXP Image MCP Server, you can use the following config object:
 // Helper config object for the ATXP Image MCP Server
-// const imageService = {
-//   mcpServer: 'https://image.mcp.atxp.ai',
-//   toolName: 'image_create_image',
-//   description: 'ATXP Image MCP server',
-//   getArguments: (prompt: string) => ({ prompt }),
-//   getResult: (result: any) => {
-//     // Parse the JSON string from the result
-//     const jsonString = result.content[0].text;
-//     return JSON.parse(jsonString);
-//   }
-// };
+const imageService = {
+  mcpServer: 'https://image.mcp.atxp.ai',
+  toolName: 'image_create_image',
+  description: 'ATXP Image MCP server',
+  getArguments: (prompt: string) => ({ prompt }),
+  getResult: (result: any) => {
+    // Parse the JSON string from the result
+    const jsonString = result.content[0].text;
+    return JSON.parse(jsonString);
+  }
+};
+
+// Helper config object for the ATXP Filestore MCP Server
+const filestoreService = { 
+  mcpServer: 'https://filestore.mcp.atxp.ai', 
+  toolName: 'filestore_write', 
+  description: 'ATXP Filestore MCP server', 
+  getArguments: (sourceUrl: string) => ({ sourceUrl, makePublic: true }), 
+  getResult: (result: any) => { 
+    // Parse the JSON string from the result
+    const jsonString = result.content[0].text; 
+    return JSON.parse(jsonString); 
+  } 
+}; 
 
 // Express API Routes
 app.get('/api/texts', (req: Request, res: Response) => {
@@ -86,18 +146,30 @@ app.post('/api/texts', async (req: Request, res: Response) => {
     id: Date.now(),
     text: text.trim(),
     timestamp: new Date().toISOString(),
+    imageUrl: '', 
+    fileName: '', 
   };
 
   // Send stage update for client creation
   sendStageUpdate(requestId, 'creating-clients', 'Initializing ATXP clients...', 'in-progress');
 
+  // Initialize ATXP modules
+  await initATXP();
+  const accountInstance = await getAccount();
+
   // TODO: Create a client using the `atxpClient` function for each ATXP MCP Server you want to use
   // See "Step 2" at https://docs.atxp.ai/client/guides/tutorial#set-up-the-connections-to-the-mcp-servers for more details.
   // For example, if you want to use the ATXP Image MCP Server, you can use the following code:
-  // const imageClient = await atxpClient({
-  //   mcpServer: imageService.mcpServer,
-  //   account: account,
-  // });
+  const imageClient = await atxpClient({
+    mcpServer: imageService.mcpServer,
+    account: accountInstance,
+  });
+
+  // Create a client using the `atxpClient` function for the ATXP Filestore MCP Server
+  const filestoreClient = await atxpClient({ 
+    mcpServer: filestoreService.mcpServer, 
+    account: accountInstance, 
+  });
 
   // Send stage update for just before the MCP tool call
   sendStageUpdate(requestId, 'calling-mcp-tool', 'Calling ATXP MCP tool...', 'in-progress');
@@ -105,32 +177,71 @@ app.post('/api/texts', async (req: Request, res: Response) => {
   try {
     // TODO: Call the MCP tool you want to use
     // For example, if you want to use the ATXP Image MCP Server, you can use the following code:
-    // const result = await imageClient.callTool({
-    //   name: imageService.toolName,
-    //   arguments: imageService.getArguments(text),
-    // });
+    const result = await imageClient.callTool({
+      name: imageService.toolName,
+      arguments: imageService.getArguments(text),
+    });
 
     // Send stage update for MCP tool call completion
     sendStageUpdate(requestId, 'mcp-tool-call-completed', 'ATXP MCP tool call completed!', 'completed');
 
     // TODO: Process the result of the MCP tool call
     // For example, if you want to use the ATXP Image MCP Server, you can use the following code:
-    // const imageResult = imageService.getResult(result);
-    // console.log('Result:', imageResult);
+    const imageResult = imageService.getResult(result);
+    console.log('Result:', imageResult);
 
 
     // Note: If you want to use the result of the MCP tool call in another MCP tool call, you will need
     // a nested try/catch block wrapping the call to the next MCP tool.
 
-    // TODO: Save the result of the MCP tool call to the `newText` object
-    // For example, if you want to use the result of the ATXP Image MCP Server, you can use the following code:
-    //newText.imageUrl = imageResult.url;
+    // // TODO: Save the result of the MCP tool call to the `newText` object
+    // // For example, if you want to use the result of the ATXP Image MCP Server, you can use the following code:
+    // newText.imageUrl = imageResult.url;
 
-    // Save the `newText` object to the `texts` array
-    texts.push(newText);
+    // // Save the `newText` object to the `texts` array
+    // texts.push(newText);
 
-    // Return the `newText` object to the frontend
-    res.status(201).json(newText);
+    // // Return the `newText` object to the frontend
+    // res.status(201).json(newText);
+
+    // Store the image in the ATXP Filestore MCP Server
+    try {
+      const result = await filestoreClient.callTool({
+        name: filestoreService.toolName,
+        arguments: filestoreService.getArguments(imageResult.url),
+      });
+      console.log(`${filestoreService.description} result successful!`);
+      const fileResult = filestoreService.getResult(result);
+      newText.fileName = fileResult.filename;
+      newText.imageUrl = fileResult.url;
+
+      console.log('Result:', fileResult);
+
+      // Send stage update for completion
+      sendStageUpdate(requestId, 'completed', 'Image stored successfully! Process completed.', 'final');
+
+      texts.push(newText);
+      res.status(201).json(newText);
+    } catch (error) {
+      console.error(`Error with ${filestoreService.description}:`, error);
+      // Send stage update for filestore error
+      sendSSEUpdate({
+        id: requestId,
+        type: 'stage-update',
+        stage: 'filestore-error',
+        message: 'Failed to store image, but continuing without filestore service...',
+        timestamp: new Date().toISOString(),
+        status: 'error'
+      });
+      // Don't exit the process, just log the error
+      console.log('Continuing without filestore service...');
+
+      // Still save the text with the image URL from the image service
+      newText.imageUrl = imageResult.url;
+      texts.push(newText);
+      res.status(201).json(newText);
+    }
+    
   } catch (error) {
     console.error(`Error with MCP tool call:`, error);
 
